@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import time
 import uuid
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
@@ -37,6 +38,10 @@ app = FastAPI(
     version="0.1.0",
     lifespan=lifespan,
 )
+
+from prometheus_fastapi_instrumentator import Instrumentator
+
+Instrumentator().instrument(app).expose(app, endpoint="/metrics")
 
 
 class RunStatus(str, Enum):
@@ -99,6 +104,9 @@ async def _publish(record: RunRecord, event_type: str, payload: dict[str, Any]) 
 
 
 async def _execute_run(record: RunRecord) -> None:
+    from app.observability.metrics import QUALITY_SCORE, RETRY_COUNT, WORKFLOW_DURATION
+
+    start = time.time()
     record.status = RunStatus.RUNNING
     graph = get_graph()
     state = initial_state(record.task)
@@ -206,6 +214,8 @@ async def _execute_run(record: RunRecord) -> None:
             logger.info("Report saved to %s (score=%.2f)", output_path, quality_score)
 
         record.status = RunStatus.COMPLETED
+        QUALITY_SCORE.set(quality_score)
+        RETRY_COUNT.observe(final_state.get("retry_count", 0))
         await _publish(
             record,
             "done",
@@ -221,6 +231,7 @@ async def _execute_run(record: RunRecord) -> None:
         record.error = str(exc)
         await _publish(record, "error", {"message": str(exc)})
     finally:
+        WORKFLOW_DURATION.observe(time.time() - start)
         await record.events.put({"type": "_stream_end"})
 
 

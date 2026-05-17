@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import logging
 import os
+import time
 from collections.abc import Awaitable, Callable
 from typing import Any
 
@@ -9,6 +10,7 @@ from langsmith import traceable
 from langsmith.run_helpers import get_current_run_tree, trace
 
 from app.config import get_settings
+from app.observability.metrics import AGENT_LATENCY, AGENT_RUN_COUNTER, TOKEN_COUNTER
 
 logger = logging.getLogger(__name__)
 
@@ -103,7 +105,16 @@ def traced_agent(
     @traceable(name=agent_name, run_type="chain", tags=["agent", agent_name])
     async def wrapped(state: Any) -> dict:
         print(f"[{agent_name.upper()}] running...")
-        return await node_fn(state)
+        start = time.time()
+        try:
+            result = await node_fn(state)
+            AGENT_RUN_COUNTER.labels(agent=agent_name, status="success").inc()
+            return result
+        except Exception:
+            AGENT_RUN_COUNTER.labels(agent=agent_name, status="error").inc()
+            raise
+        finally:
+            AGENT_LATENCY.labels(agent=agent_name).observe(time.time() - start)
 
     wrapped.__name__ = node_fn.__name__
     wrapped.__qualname__ = node_fn.__qualname__
@@ -126,6 +137,8 @@ async def traced_llm_invoke(
         response = await invoke()
         usage = extract_token_usage(response)
         record_token_usage(agent, usage)
+        TOKEN_COUNTER.labels(agent=agent, token_type="input").inc(usage["input_tokens"])
+        TOKEN_COUNTER.labels(agent=agent, token_type="output").inc(usage["output_tokens"])
 
         content = getattr(response, "content", response)
         if isinstance(content, list):
