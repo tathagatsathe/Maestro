@@ -87,15 +87,10 @@ def record_token_usage(agent: str, usage: TokenUsage) -> None:
     )
 
     run = get_current_run_tree()
-    if run is None:
+    if run is None or not hasattr(run, "add_metadata"):
         return
 
-    metadata = dict(run.metadata or {})
-    steps: list[dict[str, Any]] = list(metadata.get("token_usage_steps", []))
-    steps.append({"agent": agent, **usage})
-    metadata["token_usage"] = usage
-    metadata["token_usage_steps"] = steps
-    run.metadata = metadata
+    run.add_metadata({"agent": agent, "token_usage": usage})
 
 
 def traced_agent(
@@ -144,10 +139,12 @@ async def traced_llm_invoke(
         else:
             text = str(content)
 
-        if run_tree is not None:
-            run_tree.outputs = {
-                "content_length": len(text),
-                "token_usage": usage,
-            }
+        if run_tree is not None and hasattr(run_tree, "add_outputs"):
+            run_tree.add_outputs(
+                {
+                    "content_length": len(text),
+                    "token_usage": usage,
+                }
+            )
 
         return text, usage

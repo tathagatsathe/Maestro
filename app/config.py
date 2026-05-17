@@ -16,7 +16,7 @@ class Settings(BaseSettings):
     database_url: str = "postgresql://agent:agentpass@localhost:5432/agentdb"
     quality_threshold: float = 0.75
     max_retries: int = 3
-    anthropic_model: str = "claude-3-5-sonnet-20241022"
+    anthropic_model: str = "claude-sonnet-4-6"
     langchain_tracing_v2: bool = False
     langchain_api_key: str = ""
     langchain_project: str = "maestro"
