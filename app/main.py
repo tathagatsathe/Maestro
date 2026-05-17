@@ -16,6 +16,7 @@ from pydantic import BaseModel, Field
 
 from app.graph.graph import build_graph, initial_state
 from app.observability.langsmith_tracing import configure_langsmith
+from app.output import save_report
 
 logger = logging.getLogger(__name__)
 
@@ -193,14 +194,26 @@ async def _execute_run(record: RunRecord) -> None:
         record.final_output = final_state.get("final_output") or final_state.get(
             "draft", ""
         )
+        quality_score = float(final_state.get("quality_score", 0.0))
+        output_path: str | None = None
+        if record.final_output.strip():
+            saved = save_report(
+                task=record.task,
+                content=record.final_output,
+                quality_score=quality_score,
+            )
+            output_path = str(saved)
+            logger.info("Report saved to %s (score=%.2f)", output_path, quality_score)
+
         record.status = RunStatus.COMPLETED
         await _publish(
             record,
             "done",
             {
                 "final_output": record.final_output,
-                "quality_score": final_state.get("quality_score", 0.0),
+                "quality_score": quality_score,
                 "retry_count": final_state.get("retry_count", 0),
+                "output_path": output_path,
             },
         )
     except Exception as exc:
