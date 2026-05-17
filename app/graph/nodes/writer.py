@@ -17,7 +17,6 @@ If critic feedback is provided, revise the draft to address every point."""
 
 
 async def writer_node(state: AgentState) -> dict:
-    print("[WRITER] running...")
     task = state.get("task", "")
     research = state.get("research", "")
     critique = state.get("critique", "")
@@ -43,7 +42,7 @@ Research brief:
 
 Write the full markdown report now."""
 
-    draft = await invoke_llm(WRITER_SYSTEM, user_prompt)
+    draft = await invoke_llm(WRITER_SYSTEM, user_prompt, agent="writer")
     messages = append_message(messages, "writer", draft[:500] + ("..." if len(draft) > 500 else ""))
 
     return {

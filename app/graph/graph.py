@@ -9,6 +9,7 @@ from app.graph.nodes import (
     writer_node,
 )
 from app.graph.state import AgentState
+from app.observability.langsmith_tracing import traced_agent
 
 
 def supervisor_router(state: AgentState) -> str:
@@ -40,10 +41,10 @@ def supervisor_router(state: AgentState) -> str:
 def build_graph():
     graph = StateGraph(AgentState)
 
-    graph.add_node("supervisor", supervisor_node)
-    graph.add_node("researcher", researcher_node)
-    graph.add_node("writer", writer_node)
-    graph.add_node("critic", critic_node)
+    graph.add_node("supervisor", traced_agent("supervisor", supervisor_node))
+    graph.add_node("researcher", traced_agent("researcher", researcher_node))
+    graph.add_node("writer", traced_agent("writer", writer_node))
+    graph.add_node("critic", traced_agent("critic", critic_node))
 
     graph.set_entry_point("supervisor")
 

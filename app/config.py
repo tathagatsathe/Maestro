@@ -17,6 +17,10 @@ class Settings(BaseSettings):
     quality_threshold: float = 0.75
     max_retries: int = 3
     anthropic_model: str = "claude-3-5-sonnet-20241022"
+    langchain_tracing_v2: bool = False
+    langchain_api_key: str = ""
+    langchain_project: str = "maestro"
+    langchain_endpoint: str = "https://api.smith.langchain.com"
 
 
 @lru_cache

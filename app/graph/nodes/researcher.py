@@ -15,7 +15,6 @@ Be concise but thorough. Use markdown headings where helpful."""
 
 
 async def researcher_node(state: AgentState) -> dict:
-    print("[RESEARCHER] running...")
     task = state.get("task", "")
     plan = state.get("plan", [])
     messages = list(state.get("messages", []))
@@ -36,7 +35,7 @@ Supervisor plan:
 
 Produce a research brief the Writer can use."""
 
-    research = await invoke_llm(RESEARCHER_SYSTEM, user_prompt)
+    research = await invoke_llm(RESEARCHER_SYSTEM, user_prompt, agent="researcher")
     messages = append_message(messages, "researcher", research)
 
     return {

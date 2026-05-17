@@ -2,8 +2,10 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import uuid
 from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any
@@ -13,8 +15,27 @@ from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 
 from app.graph.graph import build_graph, initial_state
+from app.observability.langsmith_tracing import configure_langsmith
 
-app = FastAPI(title="Multi-Agent Workflow Engine", version="0.1.0")
+logger = logging.getLogger(__name__)
+
+
+@asynccontextmanager
+async def lifespan(_app: FastAPI):
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s %(levelname)s [%(name)s] %(message)s",
+    )
+    configure_langsmith()
+    logger.info("Multi-agent workflow engine started")
+    yield
+
+
+app = FastAPI(
+    title="Multi-Agent Workflow Engine",
+    version="0.1.0",
+    lifespan=lifespan,
+)
 
 
 class RunStatus(str, Enum):

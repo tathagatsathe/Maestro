@@ -38,7 +38,6 @@ def _parse_supervisor_json(raw: str) -> dict:
 
 
 async def supervisor_node(state: AgentState) -> dict:
-    print("[SUPERVISOR] running...")
     settings = get_settings()
     task = state.get("task", "")
     quality = state.get("quality_score", 0.0)
@@ -83,7 +82,7 @@ Current state:
 
 Decide the next route and update the plan if needed."""
 
-    raw = await invoke_llm(SUPERVISOR_SYSTEM, user_prompt)
+    raw = await invoke_llm(SUPERVISOR_SYSTEM, user_prompt, agent="supervisor")
     messages = append_message(messages, "supervisor", raw)
 
     try:

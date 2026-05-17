@@ -34,7 +34,6 @@ def _parse_critic_json(raw: str) -> dict:
 
 
 async def critic_node(state: AgentState) -> dict:
-    print("[CRITIC] running...")
     settings = get_settings()
     task = state.get("task", "")
     draft = state.get("draft", "")
@@ -51,7 +50,7 @@ Draft to review:
 {draft}
 """
 
-    raw = await invoke_llm(CRITIC_SYSTEM, user_prompt)
+    raw = await invoke_llm(CRITIC_SYSTEM, user_prompt, agent="critic")
     messages = append_message(messages, "critic", raw)
 
     try:

@@ -1,7 +1,10 @@
+from __future__ import annotations
+
 from langchain_anthropic import ChatAnthropic
-from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
+from langchain_core.messages import HumanMessage, SystemMessage
 
 from app.config import get_settings
+from app.observability.langsmith_tracing import TokenUsage, traced_llm_invoke
 
 
 def get_llm() -> ChatAnthropic:
@@ -14,26 +17,29 @@ def get_llm() -> ChatAnthropic:
     )
 
 
-async def invoke_llm(system: str, user: str) -> str:
+async def invoke_llm(system: str, user: str, *, agent: str) -> str:
     llm = get_llm()
-    response = await llm.ainvoke(
-        [
-            SystemMessage(content=system),
-            HumanMessage(content=user),
-        ]
+    messages = [
+        SystemMessage(content=system),
+        HumanMessage(content=user),
+    ]
+
+    text, _usage = await traced_llm_invoke(
+        agent,
+        lambda: llm.ainvoke(messages),
     )
-    content = response.content
-    if isinstance(content, str):
-        return content
-    if isinstance(content, list):
-        parts: list[str] = []
-        for block in content:
-            if isinstance(block, dict) and block.get("type") == "text":
-                parts.append(str(block.get("text", "")))
-            elif isinstance(block, str):
-                parts.append(block)
-        return "".join(parts)
-    return str(content)
+    return text
+
+
+async def invoke_llm_with_usage(
+    system: str, user: str, *, agent: str
+) -> tuple[str, TokenUsage]:
+    llm = get_llm()
+    messages = [
+        SystemMessage(content=system),
+        HumanMessage(content=user),
+    ]
+    return await traced_llm_invoke(agent, lambda: llm.ainvoke(messages))
 
 
 def append_message(messages: list[dict], role: str, content: str) -> list[dict]:
