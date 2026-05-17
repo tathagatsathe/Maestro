@@ -1,0 +1,13 @@
+.env
+# Virtual environment
+.venv/
+venv/
+ENV/
+
+# Pytest cache
+.pytest_cache/
+.pytest/
+__pycache__/
+*.pyc
+
+.DS_Store
