@@ -1,190 +1,198 @@
 # Maestro
 
-Maestro is a multi-agent research workflow engine. You submit a task (topic or question), and a team of specialized agents researches the subject, writes a markdown report, critiques it, and revises until quality meets a threshold. Results stream over Server-Sent Events (SSE), and completed reports are saved under `output/`.
+Maestro is a production-style multi-agent research workflow engine. Submit a task; a supervisor-led team of agents researches, writes a markdown report, critiques it, and revises until quality meets a threshold. Runs are durable in Postgres, executed by async Redis workers, and stream live events over SSE.
 
-## How it works
+## Architecture
 
-The workflow is built with [LangGraph](https://github.com/langchain-ai/langgraph) and orchestrated by four agents:
+```mermaid
+flowchart TB
+  Client[Client] -->|POST /run + X-API-Key| API[FastAPI API]
+  API -->|enqueue run_id| RedisQ[Redis job queue]
+  API -->|read status| PG[(Postgres)]
+  Worker[Worker process] -->|dequeue| RedisQ
+  Worker -->|LangGraph| Graph[Agent graph]
+  Graph -->|pgvector + Tavily| RAG[Hybrid retrieval]
+  Graph -->|metrics/traces| Obs[Prometheus + LangSmith]
+  Worker -->|XADD events| RedisStream[Redis Streams]
+  API -->|SSE XREAD| Client
+  Worker -->|persist run/report| PG
+```
+
+| Component | Role |
+|-----------|------|
+| **API** | Auth, rate limits, enqueue jobs, SSE proxy, run status |
+| **Worker** | Dequeues jobs, runs LangGraph workflow, publishes events |
+| **Postgres** | Durable run state, reports metadata, pgvector document chunks |
+| **Redis** | Job queue + per-run event streams for SSE |
+| **Prometheus / Grafana** | Agent latency, tokens, queue depth, cost, eval pass rate |
+
+## Agent workflow
 
 | Agent | Role |
 |-------|------|
-| **Supervisor** | Breaks the task into a plan and routes work to the right agent |
-| **Researcher** | Gathers context via Tavily web search and an in-process BM25 knowledge base |
-| **Writer** | Produces a structured markdown report from the research brief |
-| **Critic** | Scores the draft (0.0–1.0) and returns actionable feedback |
+| **Supervisor** | Plans steps and routes to researcher, writer, or critic |
+| **Researcher** | Tavily web search + pgvector semantic retrieval (BM25 fallback) |
+| **Writer** | Produces a structured markdown report |
+| **Critic** | Scores draft quality (0.0–1.0) and returns feedback |
 
-```mermaid
-flowchart LR
-  S[Supervisor] --> R[Researcher]
-  R --> W[Writer]
-  W --> C[Critic]
-  C --> S
-  S -->|quality OK or max retries| E([END])
-```
-
-- If `quality_score >= 0.75` (configurable), the run finishes and the draft becomes the final report.
-- If quality is low, the critic sends feedback and the writer revises (up to 3 retries by default).
-- When a run completes, the report is written to `output/{task}_{score}.md` (spaces in the task become underscores).
+Quality gate: `quality_score >= 0.75` (configurable) or max retries reached.
 
 ## Tech stack
 
-- **API:** FastAPI + Uvicorn (SSE streaming)
+- **API:** FastAPI + Uvicorn (SSE)
 - **Orchestration:** LangGraph
 - **LLM:** Anthropic Claude (`langchain-anthropic`)
-- **Search:** Tavily (optional) + BM25 over a small built-in knowledge base
-- **Observability:** LangSmith tracing (optional)
+- **Retrieval:** pgvector + Tavily + BM25 fallback
+- **Persistence:** Postgres (SQLAlchemy async) + Alembic migrations
+- **Queue:** Redis (job queue + event streams)
+- **Observability:** Prometheus, Grafana, LangSmith (optional)
 
 ## Prerequisites
 
-- Python 3.9+
-- [Anthropic API key](https://console.anthropic.com/) (required)
-- [Tavily API key](https://tavily.com/) (recommended for web search; the app still runs without it)
-- [LangSmith API key](https://smith.langchain.com/) (optional, for traces)
+- Python 3.10+ (3.12 recommended)
+- Docker and Docker Compose (full stack)
+- [Anthropic API key](https://console.anthropic.com/) (required for live runs)
+- [Tavily API key](https://tavily.com/) (optional, web search)
 
-Redis and PostgreSQL are defined in `docker-compose.yml` for future persistence; they are **not** required to run the API today.
-
-## Local setup
-
-### 1. Clone and enter the project
-
-```bash
-git clone <your-repo-url>
-cd Maestro
-```
-
-### 2. Create a virtual environment
-
-```bash
-python3 -m venv .venv
-source .venv/bin/activate   # Windows: .venv\Scripts\activate
-```
-
-### 3. Install dependencies
-
-```bash
-pip install -r requirements.txt
-```
-
-### 4. Configure environment variables
-
-Copy the example env file and add your keys:
+## Quick start (Docker)
 
 ```bash
 cp .env.example .env
+# Edit .env: ANTHROPIC_API_KEY, API_KEY
+
+docker compose up --build
 ```
 
-Edit `.env` — at minimum set:
+Services:
 
-```env
-ANTHROPIC_API_KEY=your_anthropic_api_key_here
-```
+| Service | URL |
+|---------|-----|
+| API | http://localhost:8000/docs |
+| Grafana | http://localhost:3000 (admin / admin) |
+| Prometheus | http://localhost:9090 |
 
-Optional but useful:
+## API usage
 
-```env
-TAVILY_API_KEY=your_tavily_api_key_here
-ANTHROPIC_MODEL=claude-sonnet-4-6
-
-# LangSmith tracing
-LANGCHAIN_TRACING_V2=true
-LANGCHAIN_API_KEY=your_langsmith_api_key_here
-LANGCHAIN_PROJECT=maestro
-```
-
-### 5. (Optional) Start Redis and Postgres
-
-Only needed if you plan to wire up persistence later:
-
-```bash
-docker compose up -d
-```
-
-### 6. Run the API server
-
-From the project root (so `app` imports resolve):
-
-```bash
-uvicorn app.main:app --reload --host 0.0.0.0 --port 8000
-```
-
-- Health check: [http://localhost:8000/health](http://localhost:8000/health)
-- Interactive API docs: [http://localhost:8000/docs](http://localhost:8000/docs)
-
-## Using the API
+All endpoints except `/health` and `/metrics` require header `X-API-Key`.
 
 ### Start a run
 
 ```bash
 curl -s -X POST http://localhost:8000/run \
   -H "Content-Type: application/json" \
+  -H "X-API-Key: dev-api-key-change-me" \
   -d '{"task": "Write a 3-bullet summary of what LangGraph is"}'
 ```
 
-Response:
-
-```json
-{"run_id": "<uuid>", "status": "pending"}
-```
-
-### Stream events
-
-Replace `<run_id>` with the value from the previous response:
+### Get run status
 
 ```bash
-curl -N http://localhost:8000/run/<run_id>/stream
+curl -s http://localhost:8000/run/<run_id> \
+  -H "X-API-Key: dev-api-key-change-me"
 ```
 
-Event types include `run_started`, `agent_start`, `agent_end`, `token` (LLM stream chunks), `done`, and `error`. The `done` event includes `final_output`, `quality_score`, `retry_count`, and `output_path`.
+### Stream events (SSE)
 
-### Output files
-
-Completed reports are saved under `output/`, for example:
-
-```text
-output/Write_a_3-bullet_summary_of_what_LangGraph_is_0.88.md
+```bash
+curl -N http://localhost:8000/run/<run_id>/stream \
+  -H "X-API-Key: dev-api-key-change-me"
 ```
 
-The filename is derived from the task text and the final quality score. The file contains the markdown report only (no score header in the body).
+### Fetch completed report
+
+```bash
+curl -s http://localhost:8000/run/<run_id>/report \
+  -H "X-API-Key: dev-api-key-change-me"
+```
+
+### Ingest knowledge for RAG
+
+```bash
+curl -s -X POST http://localhost:8000/documents \
+  -H "Content-Type: application/json" \
+  -H "X-API-Key: dev-api-key-change-me" \
+  -d '{"title": "LangGraph notes", "content": "LangGraph builds stateful multi-agent workflows as graphs..."}'
+```
+
+## Local development (without Docker)
+
+```bash
+python3 -m venv .venv && source .venv/bin/activate
+pip install -r requirements.txt
+cp .env.example .env
+
+# Start Postgres (pgvector) and Redis, then:
+uvicorn app.main:app --reload --host 0.0.0.0 --port 8000
+python -m app.worker   # separate terminal
+```
+
+Apply migrations:
+
+```bash
+alembic upgrade head
+```
 
 ## Configuration
-
-Settings are loaded from `.env` via `app/config.py`:
 
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `ANTHROPIC_API_KEY` | — | Required for LLM calls |
-| `ANTHROPIC_MODEL` | `claude-sonnet-4-6` | Claude model id |
-| `TAVILY_API_KEY` | — | Enables live web search |
-| `QUALITY_THRESHOLD` | `0.75` | Minimum score to approve a report |
-| `MAX_RETRIES` | `3` | Max critic-driven revision loops |
-| `LANGCHAIN_TRACING_V2` | `false` | Enable LangSmith traces |
+| `API_KEY` | `dev-api-key-change-me` | Required on all protected endpoints |
+| `RATE_LIMIT_RUNS_PER_MINUTE` | `10` | Per-API-key submission limit |
+| `DATABASE_URL` | `postgresql+asyncpg://...` | Postgres connection |
+| `REDIS_URL` | `redis://localhost:6379` | Redis connection |
+| `QUALITY_THRESHOLD` | `0.75` | Minimum critic score to approve |
+| `MAX_RETRIES` | `3` | Max revision loops |
+| `LLM_INPUT_COST_PER_MILLION` | `3.0` | USD per 1M input tokens (estimate) |
+| `LLM_OUTPUT_COST_PER_MILLION` | `15.0` | USD per 1M output tokens (estimate) |
+
+## Observability
+
+- **Prometheus:** `GET /metrics` (API) and worker metrics on `:9100`
+- **Grafana:** pre-provisioned dashboard — agent runs, latency, tokens, queue depth, run cost, eval pass rate
+- **LangSmith:** set `LANGCHAIN_TRACING_V2=true` and `LANGCHAIN_API_KEY`
+
+### Benchmark notes (local, single worker)
+
+Approximate ranges from development runs (vary by task length and model):
+
+| Metric | Typical range |
+|--------|----------------|
+| End-to-end workflow | 30–120 s |
+| Tokens per run | 8k–25k |
+| Estimated cost per run | $0.05–$0.25 USD |
+
+Run a quick load check with concurrent `POST /run` calls and inspect `workflow_duration_seconds` and `queue_depth` in Grafana.
+
+## Tests and evals
+
+```bash
+pytest
+ruff check app tests scripts
+python scripts/run_eval.py --mode mock   # CI-safe golden-task evals
+python scripts/run_eval.py --mode live   # full workflow (costs API credits)
+```
+
+CI (GitHub Actions) runs lint, unit tests, mocked graph integration tests, and mock evals on every push.
 
 ## Project layout
 
 ```text
 app/
-  main.py              # FastAPI app, run store, SSE streaming
-  config.py            # Settings from environment
-  output.py            # Save reports to output/
-  graph/
-    graph.py           # LangGraph definition and routing
-    state.py           # Shared agent state
-    nodes/             # supervisor, researcher, writer, critic
-  tools/
-    search.py          # Tavily + BM25 knowledge base
-  observability/
-    langsmith_tracing.py
-tests/                 # pytest suite
-output/                # Generated reports (gitignored)
-docker-compose.yml     # Redis + Postgres (optional)
-```
-
-## Tests
-
-```bash
-pytest
+  main.py              # FastAPI API
+  worker.py            # Redis worker entrypoint
+  runner.py            # LangGraph execution + event publishing
+  db/                  # SQLAlchemy models, repository
+  queue/               # Redis job queue + event streams
+  rag/                 # pgvector ingest + embeddings
+  graph/               # LangGraph agents
+  evals/               # Golden-task eval harness
+  observability/       # Metrics + LangSmith tracing
+alembic/               # Database migrations
+monitoring/            # Prometheus + Grafana
+scripts/run_eval.py    # Eval CLI
 ```
 
 ## License
 
-Add your license here.
+MIT

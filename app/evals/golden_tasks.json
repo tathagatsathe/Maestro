@@ -1,0 +1,20 @@
+[
+  {
+    "id": "langgraph-overview",
+    "task": "Write a short summary of what LangGraph is and how it helps multi-agent workflows",
+    "min_output_length": 200,
+    "required_terms": ["LangGraph", "agent"]
+  },
+  {
+    "id": "rag-basics",
+    "task": "Explain retrieval-augmented generation in 3 bullet points",
+    "min_output_length": 150,
+    "required_terms": ["retrieval", "generation"]
+  },
+  {
+    "id": "supervisor-pattern",
+    "task": "Describe the supervisor pattern for coordinating specialized agents",
+    "min_output_length": 180,
+    "required_terms": ["supervisor"]
+  }
+]

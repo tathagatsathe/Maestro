@@ -104,7 +104,7 @@ def traced_agent(
 
     @traceable(name=agent_name, run_type="chain", tags=["agent", agent_name])
     async def wrapped(state: Any) -> dict:
-        print(f"[{agent_name.upper()}] running...")
+        logger.debug("[%s] running...", agent_name.upper())
         start = time.time()
         try:
             result = await node_fn(state)
@@ -139,6 +139,12 @@ async def traced_llm_invoke(
         record_token_usage(agent, usage)
         TOKEN_COUNTER.labels(agent=agent, token_type="input").inc(usage["input_tokens"])
         TOKEN_COUNTER.labels(agent=agent, token_type="output").inc(usage["output_tokens"])
+
+        from app.run_context import get_run_context
+
+        run_ctx = get_run_context()
+        if run_ctx is not None:
+            run_ctx.add_tokens(usage["input_tokens"], usage["output_tokens"])
 
         content = getattr(response, "content", response)
         if isinstance(content, list):
