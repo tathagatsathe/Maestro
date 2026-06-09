@@ -3,12 +3,12 @@ from __future__ import annotations
 import logging
 import time
 import uuid
+from pathlib import Path
 from typing import Any
 
-from app.db.models import RunStatus, RunType
+from app.db.models import Run, RunStatus
 from app.db.repository import RunRepository
-from app.db.session import get_session_factory
-from app.graph.graph import build_graph, initial_state
+from app.graph.explain_graph import build_explain_graph, initial_explain_state
 from app.observability.metrics import (
     QUALITY_SCORE,
     RETRY_COUNT,
@@ -16,41 +16,43 @@ from app.observability.metrics import (
     WORKFLOW_DURATION,
 )
 from app.output import save_report
+from app.pdf.storage import load_extracted_text
 from app.queue.events import RunEventPublisher
 from app.run_context import RunContext, clear_run_context, set_run_context
 
 logger = logging.getLogger(__name__)
 
-_compiled_graph = None
+_compiled_explain_graph = None
+
+EXPLAIN_AGENTS = {"analyzer", "explainer", "readability_critic"}
+
+EXPLAIN_AGENT_END_KEYS = {
+    "paper_brief",
+    "draft",
+    "critique",
+    "quality_score",
+    "retry_count",
+    "current_agent",
+}
 
 
-def get_graph():
-    global _compiled_graph
-    if _compiled_graph is None:
-        _compiled_graph = build_graph()
-    return _compiled_graph
+def get_explain_graph():
+    global _compiled_explain_graph
+    if _compiled_explain_graph is None:
+        _compiled_explain_graph = build_explain_graph()
+    return _compiled_explain_graph
 
 
-async def execute_run(run_id: uuid.UUID) -> None:
-    """Execute a workflow run and publish events to Redis."""
-    factory = get_session_factory()
-    async with factory() as session:
-        repo = RunRepository(session)
-        run = await repo.get(run_id)
-        if run is None:
-            logger.error("Run %s not found", run_id)
-            return
-        if run.run_type == RunType.EXPLAIN_PAPER.value:
-            from app.runner_explain import execute_explain_run
-
-            await execute_explain_run(run_id)
-            return
-
-    await _execute_research_run(run_id)
+def _paper_title_from_run(run: Run) -> str:
+    if run.source_filename:
+        return Path(run.source_filename).stem.replace("_", " ").replace("-", " ")
+    return "Research paper"
 
 
-async def _execute_research_run(run_id: uuid.UUID) -> None:
-    """Execute the research workflow run and publish events to Redis."""
+async def execute_explain_run(run_id: uuid.UUID) -> None:
+    """Execute a paper explanation workflow and publish events to Redis."""
+    from app.db.session import get_session_factory
+
     factory = get_session_factory()
     publisher = RunEventPublisher(str(run_id))
     ctx = RunContext(run_id=run_id)
@@ -61,20 +63,31 @@ async def _execute_research_run(run_id: uuid.UUID) -> None:
         repo = RunRepository(session)
         run = await repo.get(run_id)
         if run is None:
-            logger.error("Run %s not found", run_id)
+            logger.error("Explain run %s not found", run_id)
             clear_run_context()
             return
 
         await repo.update_status(run_id, RunStatus.RUNNING)
 
         try:
+            paper_text = load_extracted_text(run_id)
+            paper_title = _paper_title_from_run(run)
+
             await publisher.publish(
                 "run_started",
-                {"task": run.task, "run_id": str(run_id)},
+                {
+                    "task": run.task,
+                    "run_id": str(run_id),
+                    "run_type": run.run_type,
+                    "source_filename": run.source_filename,
+                },
             )
 
-            graph = get_graph()
-            state = initial_state(run.task)
+            graph = get_explain_graph()
+            state = initial_explain_state(
+                paper_text=paper_text,
+                paper_title=paper_title,
+            )
             final_state: dict[str, Any] | None = None
 
             async for event in graph.astream_events(state, version="v2"):
@@ -83,20 +96,10 @@ async def _execute_research_run(run_id: uuid.UUID) -> None:
                 data = event.get("data", {})
                 metadata = event.get("metadata", {})
 
-                if kind == "on_chain_start" and name in {
-                    "supervisor",
-                    "researcher",
-                    "writer",
-                    "critic",
-                }:
+                if kind == "on_chain_start" and name in EXPLAIN_AGENTS:
                     await publisher.publish("agent_start", {"agent": name})
 
-                if kind == "on_chain_end" and name in {
-                    "supervisor",
-                    "researcher",
-                    "writer",
-                    "critic",
-                }:
+                if kind == "on_chain_end" and name in EXPLAIN_AGENTS:
                     output = data.get("output") or {}
                     await publisher.publish(
                         "agent_end",
@@ -105,17 +108,7 @@ async def _execute_research_run(run_id: uuid.UUID) -> None:
                             "updates": {
                                 k: v
                                 for k, v in output.items()
-                                if k
-                                in {
-                                    "plan",
-                                    "research",
-                                    "draft",
-                                    "critique",
-                                    "quality_score",
-                                    "retry_count",
-                                    "current_agent",
-                                    "next_route",
-                                }
+                                if k in EXPLAIN_AGENT_END_KEYS
                                 and (not isinstance(v, str) or len(v) <= 500)
                             },
                         },
@@ -164,7 +157,9 @@ async def _execute_research_run(run_id: uuid.UUID) -> None:
                     quality_score=quality_score,
                 )
                 output_path = str(saved)
-                logger.info("Report saved to %s (score=%.2f)", output_path, quality_score)
+                logger.info(
+                    "Explanation saved to %s (score=%.2f)", output_path, quality_score
+                )
 
             cost = ctx.estimated_cost_usd()
             await repo.complete(
@@ -194,7 +189,7 @@ async def _execute_research_run(run_id: uuid.UUID) -> None:
                 },
             )
         except Exception as exc:
-            logger.exception("Run %s failed", run_id)
+            logger.exception("Explain run %s failed", run_id)
             await repo.fail(run_id, str(exc))
             await publisher.publish("error", {"message": str(exc)})
         finally:
