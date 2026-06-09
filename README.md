@@ -37,6 +37,20 @@ flowchart TB
 
 Quality gate: `quality_score >= 0.75` (configurable) or max retries reached.
 
+### Paper explainer workflow
+
+Upload a research paper PDF to get a plain-language explanation for non-experts.
+
+| Agent | Role |
+|-------|------|
+| **Analyzer** | Extracts a structured brief from the paper (map-reduce for long PDFs) |
+| **Explainer** | Writes an accessible markdown explanation |
+| **Readability Critic** | Scores clarity for non-experts and requests revisions |
+
+Quality gate uses the same `quality_threshold` and `max_retries`, evaluated on readability rather than research depth.
+
+**Note:** Scanned or image-only PDFs without OCR are not supported.
+
 ## Tech stack
 
 - **API:** FastAPI + Uvicorn (SSE)
@@ -105,6 +119,33 @@ curl -s http://localhost:8000/run/<run_id>/report \
   -H "X-API-Key: dev-api-key-change-me"
 ```
 
+### Explain a research paper (PDF)
+
+Upload a PDF from any folder on your machine. The `@` prefix is required so curl sends the file, not the path string.
+
+```bash
+# 1. Upload PDF and start an explanation run
+curl -s -X POST http://localhost:8000/explain-paper \
+  -H "X-API-Key: dev-api-key-change-me" \
+  -F "file=@/path/to/your/paper.pdf"
+# → {"run_id":"<uuid>","status":"pending"}
+
+# 2. Check run status
+export RUN_ID="<paste-run-id-here>"
+curl -s http://localhost:8000/run/$RUN_ID \
+  -H "X-API-Key: dev-api-key-change-me"
+
+# 3. Stream live progress (Ctrl+C to stop)
+curl -N http://localhost:8000/run/$RUN_ID/stream \
+  -H "X-API-Key: dev-api-key-change-me"
+
+# 4. Fetch plain-language explanation (when status is completed)
+curl -s http://localhost:8000/run/$RUN_ID/report \
+  -H "X-API-Key: dev-api-key-change-me"
+```
+
+The worker must be running for the run to progress past `pending`.
+
 ### Ingest knowledge for RAG
 
 ```bash
@@ -116,20 +157,46 @@ curl -s -X POST http://localhost:8000/documents \
 
 ## Local development (without Docker)
 
+Requires Postgres (pgvector) and Redis. The easiest way is to start only those services via Docker:
+
 ```bash
+# One-time setup
 python3 -m venv .venv && source .venv/bin/activate
 pip install -r requirements.txt
 cp .env.example .env
+# Edit .env: ANTHROPIC_API_KEY, API_KEY
 
-# Start Postgres (pgvector) and Redis, then:
-uvicorn app.main:app --reload --host 0.0.0.0 --port 8000
-python -m app.worker   # separate terminal
+# Start Postgres + Redis (Docker Desktop must be running)
+docker compose up -d postgres redis
+
+# Apply migrations
+alembic upgrade head
 ```
 
-Apply migrations:
+If tables already exist but migrations fail, stamp the current revision first:
 
 ```bash
+alembic stamp 001
 alembic upgrade head
+```
+
+Start the API and worker in **separate terminals**:
+
+```bash
+# Terminal 1 — API
+source .venv/bin/activate
+uvicorn app.main:app --reload --host 127.0.0.1 --port 8000
+
+# Terminal 2 — worker
+source .venv/bin/activate
+python -m app.worker
+```
+
+Verify the API is up:
+
+```bash
+curl http://127.0.0.1:8000/health
+# → {"status":"ok"}
 ```
 
 ## Configuration
@@ -145,6 +212,9 @@ alembic upgrade head
 | `MAX_RETRIES` | `3` | Max revision loops |
 | `LLM_INPUT_COST_PER_MILLION` | `3.0` | USD per 1M input tokens (estimate) |
 | `LLM_OUTPUT_COST_PER_MILLION` | `15.0` | USD per 1M output tokens (estimate) |
+| `MAX_PDF_SIZE_MB` | `20` | Maximum uploaded PDF size |
+| `MAX_PDF_PAGES` | `100` | Maximum PDF page count |
+| `MIN_EXTRACTED_CHARS` | `500` | Minimum extractable text (rejects scanned PDFs) |
 
 ## Observability
 
@@ -182,6 +252,8 @@ app/
   main.py              # FastAPI API
   worker.py            # Redis worker entrypoint
   runner.py            # LangGraph execution + event publishing
+  runner_explain.py    # Paper explanation workflow
+  pdf/                 # PDF extraction + upload storage
   db/                  # SQLAlchemy models, repository
   queue/               # Redis job queue + event streams
   rag/                 # pgvector ingest + embeddings
