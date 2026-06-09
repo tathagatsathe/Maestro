@@ -22,6 +22,11 @@ class RunStatus(str, enum.Enum):
     FAILED = "failed"
 
 
+class RunType(str, enum.Enum):
+    RESEARCH = "research"
+    EXPLAIN_PAPER = "explain_paper"
+
+
 class Run(Base):
     __tablename__ = "runs"
 
@@ -29,6 +34,10 @@ class Run(Base):
         UUID(as_uuid=True), primary_key=True, default=uuid.uuid4
     )
     task: Mapped[str] = mapped_column(Text, nullable=False)
+    run_type: Mapped[str] = mapped_column(
+        String(32), nullable=False, default=RunType.RESEARCH.value
+    )
+    source_filename: Mapped[Optional[str]] = mapped_column(String(512), nullable=True)
     status: Mapped[str] = mapped_column(
         String(32), nullable=False, default=RunStatus.PENDING.value
     )
