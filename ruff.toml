@@ -1,0 +1,12 @@
+target-version = "py312"
+line-length = 100
+
+[lint]
+select = ["E", "F", "I", "UP"]
+
+[lint.per-file-ignores]
+"alembic/env.py" = ["E402"]
+"scripts/run_eval.py" = ["E402"]
+"app/db/models.py" = ["UP042", "UP045"]
+"app/db/repository.py" = ["UP017"]
+"app/main.py" = ["UP045"]
