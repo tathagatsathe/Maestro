@@ -1,7 +1,5 @@
 from __future__ import annotations
 
-import pytest
-
 from app.graph.graph import initial_state, supervisor_router
 from app.graph.state import AgentState
 
