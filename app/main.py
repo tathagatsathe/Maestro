@@ -5,16 +5,18 @@ import uuid
 from contextlib import asynccontextmanager
 from typing import Annotated, Optional
 
-from fastapi import Depends, FastAPI, HTTPException
+from fastapi import Depends, FastAPI, File, HTTPException, UploadFile
 from fastapi.responses import PlainTextResponse, StreamingResponse
 from prometheus_fastapi_instrumentator import Instrumentator
 from pydantic import BaseModel, Field
 
 from app.auth import verify_api_key
-from app.db.models import RunStatus
+from app.db.models import RunStatus, RunType
 from app.db.repository import RunRepository
 from app.db.session import get_session_factory, init_db
 from app.observability.langsmith_tracing import configure_langsmith
+from app.pdf.extract import extract_text_from_pdf
+from app.pdf.storage import save_run_artifacts
 from app.queue.events import stream_run_events
 from app.queue.jobs import JobQueue
 from app.rag.ingest import ingest_document
@@ -57,6 +59,8 @@ class RunDetailResponse(BaseModel):
     run_id: str
     task: str
     status: RunStatus
+    run_type: RunType = RunType.RESEARCH
+    source_filename: Optional[str] = None
     quality_score: Optional[float] = None
     retry_count: Optional[int] = None
     output_path: Optional[str] = None
@@ -126,6 +130,8 @@ async def get_run(
             run_id=str(run.id),
             task=run.task,
             status=RunStatus(run.status),
+            run_type=RunType(run.run_type or RunType.RESEARCH.value),
+            source_filename=run.source_filename,
             quality_score=run.quality_score,
             retry_count=run.retry_count,
             output_path=run.output_path,
@@ -184,6 +190,45 @@ async def stream_run(
             "X-Accel-Buffering": "no",
         },
     )
+
+
+@app.post("/explain-paper", response_model=RunResponse)
+async def explain_paper(
+    api_key: Annotated[str, Depends(verify_api_key)],
+    file: UploadFile = File(...),
+) -> RunResponse:
+    await check_rate_limit(api_key)
+
+    filename = file.filename or ""
+    if not filename.lower().endswith(".pdf"):
+        raise HTTPException(status_code=400, detail="Only PDF files are supported")
+
+    file_bytes = await file.read()
+    try:
+        extracted = extract_text_from_pdf(file_bytes)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    factory = get_session_factory()
+    async with factory() as session:
+        repo = RunRepository(session)
+        run = await repo.create_explain_run(filename)
+
+    try:
+        save_run_artifacts(
+            run.id,
+            pdf_bytes=file_bytes,
+            extracted_text=extracted.text,
+        )
+    except OSError as exc:
+        raise HTTPException(
+            status_code=500, detail="Failed to store uploaded paper"
+        ) from exc
+
+    queue = JobQueue()
+    await queue.enqueue(run.id)
+
+    return RunResponse(run_id=str(run.id), status=RunStatus(run.status))
 
 
 @app.post("/documents", response_model=DocumentResponse)

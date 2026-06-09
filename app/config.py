@@ -29,6 +29,10 @@ class Settings(BaseSettings):
     embedding_dimensions: int = 384
     job_queue_key: str = "maestro:jobs"
     run_events_stream_prefix: str = "maestro:events"
+    max_pdf_size_mb: int = 20
+    max_pdf_pages: int = 100
+    paper_chunk_size: int = 12_000
+    min_extracted_chars: int = 500
 
 
 @lru_cache

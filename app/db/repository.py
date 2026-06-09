@@ -6,7 +6,7 @@ from datetime import datetime, timezone
 from sqlalchemy import select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.db.models import Chunk, Document, Run, RunStatus
+from app.db.models import Chunk, Document, Run, RunStatus, RunType
 
 
 class RunRepository:
@@ -15,6 +15,18 @@ class RunRepository:
 
     async def create(self, task: str) -> Run:
         run = Run(task=task, status=RunStatus.PENDING.value)
+        self._session.add(run)
+        await self._session.commit()
+        await self._session.refresh(run)
+        return run
+
+    async def create_explain_run(self, source_filename: str) -> Run:
+        run = Run(
+            task=f"Explain research paper: {source_filename}",
+            run_type=RunType.EXPLAIN_PAPER.value,
+            source_filename=source_filename,
+            status=RunStatus.PENDING.value,
+        )
         self._session.add(run)
         await self._session.commit()
         await self._session.refresh(run)
