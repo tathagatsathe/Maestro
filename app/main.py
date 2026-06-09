@@ -1,23 +1,24 @@
 from __future__ import annotations
 
-import asyncio
-import json
 import logging
-import time
 import uuid
-from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
-from dataclasses import dataclass, field
-from enum import Enum
-from typing import Any
+from typing import Annotated, Optional
 
-from fastapi import FastAPI, HTTPException
-from fastapi.responses import StreamingResponse
+from fastapi import Depends, FastAPI, HTTPException
+from fastapi.responses import PlainTextResponse, StreamingResponse
+from prometheus_fastapi_instrumentator import Instrumentator
 from pydantic import BaseModel, Field
 
-from app.graph.graph import build_graph, initial_state
+from app.auth import verify_api_key
+from app.db.models import RunStatus
+from app.db.repository import RunRepository
+from app.db.session import get_session_factory, init_db
 from app.observability.langsmith_tracing import configure_langsmith
-from app.output import save_report
+from app.queue.events import stream_run_events
+from app.queue.jobs import JobQueue
+from app.rag.ingest import ingest_document
+from app.rate_limit import check_rate_limit
 
 logger = logging.getLogger(__name__)
 
@@ -29,68 +30,22 @@ async def lifespan(_app: FastAPI):
         format="%(asctime)s %(levelname)s [%(name)s] %(message)s",
     )
     configure_langsmith()
-    logger.info("Multi-agent workflow engine started")
+    await init_db()
+    logger.info("Multi-agent workflow API started")
     yield
 
 
 app = FastAPI(
     title="Multi-Agent Workflow Engine",
-    version="0.1.0",
+    version="0.2.0",
     lifespan=lifespan,
 )
-
-from prometheus_fastapi_instrumentator import Instrumentator
 
 Instrumentator().instrument(app).expose(app, endpoint="/metrics")
 
 
-class RunStatus(str, Enum):
-    PENDING = "pending"
-    RUNNING = "running"
-    COMPLETED = "completed"
-    FAILED = "failed"
-
-
-@dataclass
-class RunRecord:
-    run_id: str
-    task: str
-    status: RunStatus = RunStatus.PENDING
-    events: asyncio.Queue[dict[str, Any]] = field(default_factory=asyncio.Queue)
-    final_output: str = ""
-    error: str | None = None
-
-
-class RunStore:
-    def __init__(self) -> None:
-        self._runs: dict[str, RunRecord] = {}
-        self._lock = asyncio.Lock()
-
-    async def create(self, task: str) -> RunRecord:
-        run_id = str(uuid.uuid4())
-        record = RunRecord(run_id=run_id, task=task)
-        async with self._lock:
-            self._runs[run_id] = record
-        return record
-
-    async def get(self, run_id: str) -> RunRecord | None:
-        async with self._lock:
-            return self._runs.get(run_id)
-
-
-run_store = RunStore()
-_compiled_graph = None
-
-
-def get_graph():
-    global _compiled_graph
-    if _compiled_graph is None:
-        _compiled_graph = build_graph()
-    return _compiled_graph
-
-
 class RunRequest(BaseModel):
-    task: str = Field(..., min_length=1, description="User task / prompt")
+    task: str = Field(..., min_length=1, max_length=4000, description="User task / prompt")
 
 
 class RunResponse(BaseModel):
@@ -98,141 +53,33 @@ class RunResponse(BaseModel):
     status: RunStatus
 
 
-async def _publish(record: RunRecord, event_type: str, payload: dict[str, Any]) -> None:
-    event = {"type": event_type, **payload}
-    await record.events.put(event)
+class RunDetailResponse(BaseModel):
+    run_id: str
+    task: str
+    status: RunStatus
+    quality_score: Optional[float] = None
+    retry_count: Optional[int] = None
+    output_path: Optional[str] = None
+    error: Optional[str] = None
+    input_tokens: int = 0
+    output_tokens: int = 0
+    estimated_cost_usd: Optional[float] = None
 
 
-async def _execute_run(record: RunRecord) -> None:
-    from app.observability.metrics import QUALITY_SCORE, RETRY_COUNT, WORKFLOW_DURATION
+class DocumentRequest(BaseModel):
+    title: str = Field(..., min_length=1, max_length=512)
+    content: str = Field(..., min_length=1, max_length=100_000)
+    source: Optional[str] = Field(default=None, max_length=512)
 
-    start = time.time()
-    record.status = RunStatus.RUNNING
-    graph = get_graph()
-    state = initial_state(record.task)
 
-    try:
-        await _publish(
-            record,
-            "run_started",
-            {"task": record.task, "run_id": record.run_id},
-        )
+class DocumentResponse(BaseModel):
+    document_id: str
 
-        final_state: dict[str, Any] | None = None
 
-        async for event in graph.astream_events(state, version="v2"):
-            kind = event.get("event")
-            name = event.get("name", "")
-            data = event.get("data", {})
-            metadata = event.get("metadata", {})
-
-            if kind == "on_chain_start" and name in {
-                "supervisor",
-                "researcher",
-                "writer",
-                "critic",
-            }:
-                await _publish(
-                    record,
-                    "agent_start",
-                    {"agent": name},
-                )
-
-            if kind == "on_chain_end" and name in {
-                "supervisor",
-                "researcher",
-                "writer",
-                "critic",
-            }:
-                output = data.get("output") or {}
-                await _publish(
-                    record,
-                    "agent_end",
-                    {
-                        "agent": name,
-                        "updates": {
-                            k: v
-                            for k, v in output.items()
-                            if k
-                            in {
-                                "plan",
-                                "research",
-                                "draft",
-                                "critique",
-                                "quality_score",
-                                "retry_count",
-                                "current_agent",
-                                "next_route",
-                            }
-                            and (not isinstance(v, str) or len(v) <= 500)
-                        },
-                    },
-                )
-
-            if kind == "on_chain_end" and name == "LangGraph":
-                final_state = data.get("output")
-
-            if kind == "on_chat_model_stream":
-                chunk = data.get("chunk")
-                if chunk is not None:
-                    content = getattr(chunk, "content", None)
-                    if content:
-                        if isinstance(content, list):
-                            text = "".join(
-                                block.get("text", "")
-                                if isinstance(block, dict)
-                                else str(block)
-                                for block in content
-                            )
-                        else:
-                            text = str(content)
-                        if text:
-                            await _publish(
-                                record,
-                                "token",
-                                {
-                                    "agent": metadata.get("langgraph_node", ""),
-                                    "text": text,
-                                },
-                            )
-
-        if final_state is None:
-            final_state = await graph.ainvoke(state)
-
-        record.final_output = final_state.get("final_output") or final_state.get(
-            "draft", ""
-        )
-        quality_score = float(final_state.get("quality_score", 0.0))
-        output_path: str | None = None
-        if record.final_output.strip():
-            saved = save_report(
-                task=record.task,
-                content=record.final_output,
-                quality_score=quality_score,
-            )
-            output_path = str(saved)
-            logger.info("Report saved to %s (score=%.2f)", output_path, quality_score)
-
-        record.status = RunStatus.COMPLETED
-        QUALITY_SCORE.set(quality_score)
-        RETRY_COUNT.observe(final_state.get("retry_count", 0))
-        await _publish(
-            record,
-            "done",
-            {
-                "final_output": record.final_output,
-                "quality_score": quality_score,
-                "retry_count": final_state.get("retry_count", 0),
-                "output_path": output_path,
-            },
-        )
-    except Exception as exc:
-        record.status = RunStatus.FAILED
-        record.error = str(exc)
-        await _publish(record, "error", {"message": str(exc)})
-    finally:
-        WORKFLOW_DURATION.observe(time.time() - start)
-        await record.events.put({"type": "_stream_end"})
+async def _get_repo() -> RunRepository:
+    factory = get_session_factory()
+    async with factory() as session:
+        yield RunRepository(session)
 
 
 @app.get("/health")
@@ -241,28 +88,95 @@ async def health() -> dict[str, str]:
 
 
 @app.post("/run", response_model=RunResponse)
-async def start_run(body: RunRequest) -> RunResponse:
-    record = await run_store.create(body.task)
-    asyncio.create_task(_execute_run(record))
-    return RunResponse(run_id=record.run_id, status=record.status)
+async def start_run(
+    body: RunRequest,
+    api_key: Annotated[str, Depends(verify_api_key)],
+) -> RunResponse:
+    await check_rate_limit(api_key)
+
+    factory = get_session_factory()
+    async with factory() as session:
+        repo = RunRepository(session)
+        run = await repo.create(body.task)
+
+    queue = JobQueue()
+    await queue.enqueue(run.id)
+
+    return RunResponse(run_id=str(run.id), status=RunStatus(run.status))
 
 
-async def _sse_generator(record: RunRecord) -> AsyncIterator[str]:
-    while True:
-        event = await record.events.get()
-        if event.get("type") == "_stream_end":
-            break
-        yield f"data: {json.dumps(event)}\n\n"
+@app.get("/run/{run_id}", response_model=RunDetailResponse)
+async def get_run(
+    run_id: str,
+    _api_key: Annotated[str, Depends(verify_api_key)],
+) -> RunDetailResponse:
+    try:
+        run_uuid = uuid.UUID(run_id)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail="Invalid run_id") from exc
+
+    factory = get_session_factory()
+    async with factory() as session:
+        repo = RunRepository(session)
+        run = await repo.get(run_uuid)
+        if run is None:
+            raise HTTPException(status_code=404, detail="Run not found")
+
+        return RunDetailResponse(
+            run_id=str(run.id),
+            task=run.task,
+            status=RunStatus(run.status),
+            quality_score=run.quality_score,
+            retry_count=run.retry_count,
+            output_path=run.output_path,
+            error=run.error,
+            input_tokens=run.input_tokens,
+            output_tokens=run.output_tokens,
+            estimated_cost_usd=run.estimated_cost_usd,
+        )
+
+
+@app.get("/run/{run_id}/report")
+async def get_run_report(
+    run_id: str,
+    _api_key: Annotated[str, Depends(verify_api_key)],
+) -> PlainTextResponse:
+    try:
+        run_uuid = uuid.UUID(run_id)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail="Invalid run_id") from exc
+
+    factory = get_session_factory()
+    async with factory() as session:
+        repo = RunRepository(session)
+        run = await repo.get(run_uuid)
+        if run is None:
+            raise HTTPException(status_code=404, detail="Run not found")
+        if run.status != RunStatus.COMPLETED.value or not run.final_output:
+            raise HTTPException(status_code=404, detail="Report not available")
+
+        return PlainTextResponse(run.final_output, media_type="text/markdown")
 
 
 @app.get("/run/{run_id}/stream")
-async def stream_run(run_id: str) -> StreamingResponse:
-    record = await run_store.get(run_id)
-    if record is None:
-        raise HTTPException(status_code=404, detail="Run not found")
+async def stream_run(
+    run_id: str,
+    _api_key: Annotated[str, Depends(verify_api_key)],
+) -> StreamingResponse:
+    try:
+        uuid.UUID(run_id)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail="Invalid run_id") from exc
+
+    factory = get_session_factory()
+    async with factory() as session:
+        repo = RunRepository(session)
+        run = await repo.get(uuid.UUID(run_id))
+        if run is None:
+            raise HTTPException(status_code=404, detail="Run not found")
 
     return StreamingResponse(
-        _sse_generator(record),
+        stream_run_events(run_id),
         media_type="text/event-stream",
         headers={
             "Cache-Control": "no-cache",
@@ -270,3 +184,20 @@ async def stream_run(run_id: str) -> StreamingResponse:
             "X-Accel-Buffering": "no",
         },
     )
+
+
+@app.post("/documents", response_model=DocumentResponse)
+async def create_document(
+    body: DocumentRequest,
+    _api_key: Annotated[str, Depends(verify_api_key)],
+) -> DocumentResponse:
+    try:
+        document_id = await ingest_document(
+            title=body.title,
+            content=body.content,
+            source=body.source,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    return DocumentResponse(document_id=document_id)
